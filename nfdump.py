@@ -111,7 +111,19 @@ static int packet_matches_filter(struct packet_info *info)
     return 0;  // No match, drop packet
 }
 
-// kprobe for netfilter hooks - improved version
+// Structure definitions for netfilter internals
+struct nf_hook_state {
+    u8 hook;
+    u8 pf;
+    // Other fields exist but we only need these
+};
+
+struct xt_table {
+    char name[32];
+    // Other fields exist but we only need the name
+};
+
+// kprobe for netfilter hooks - comprehensive version
 int trace_nf_hook_slow(struct pt_regs *ctx)
 {
     struct packet_info info = {};
@@ -123,6 +135,13 @@ int trace_nf_hook_slow(struct pt_regs *ctx)
     
     // Get sk_buff from first parameter
     struct sk_buff *skb = (struct sk_buff *)PT_REGS_PARM1(ctx);
+    
+    // Try to get nf_hook_state from second parameter
+    struct nf_hook_state *state = (struct nf_hook_state *)PT_REGS_PARM2(ctx);
+    if (state) {
+        bpf_probe_read(&info.hooknum, sizeof(info.hooknum), &state->hook);
+        bpf_probe_read(&info.pf, sizeof(info.pf), &state->pf);
+    }
     
     if (skb) {
         // Direct memory access approach using verified offsets for common kernels
@@ -187,7 +206,7 @@ int trace_nf_hook_slow(struct pt_regs *ctx)
         packet_processed:;
     }
     
-    // Try to get hook number from function parameters
+    // Try to get hook number from function parameters (fallback method)
     u32 hooknum = 0;
     bpf_probe_read(&hooknum, sizeof(hooknum), (void *)PT_REGS_PARM3(ctx));
     if (hooknum < 5) {
@@ -225,12 +244,106 @@ int trace_nf_hook_slow(struct pt_regs *ctx)
     return 0;
 }
 
+// Specialized probes for specific table functions
+int trace_ipt_do_table(struct pt_regs *ctx)
+{
+    struct packet_info info = {};
+    
+    info.timestamp = bpf_ktime_get_ns();
+    info.pf = 2;       // IPv4
+    info.protocol = 1; // Default ICMP
+    
+    // Get sk_buff from first parameter
+    struct sk_buff *skb = (struct sk_buff *)PT_REGS_PARM1(ctx);
+    
+    // Get hook number from second parameter (typically the state)
+    struct nf_hook_state *state = (struct nf_hook_state *)PT_REGS_PARM2(ctx);
+    if (state) {
+        bpf_probe_read(&info.hooknum, sizeof(info.hooknum), &state->hook);
+        bpf_probe_read(&info.pf, sizeof(info.pf), &state->pf);
+    }
+    
+    // Get table from third parameter
+    struct xt_table *table = (struct xt_table *)PT_REGS_PARM3(ctx);
+    if (table) {
+        bpf_probe_read_str(info.table_name, sizeof(info.table_name), table->name);
+    } else {
+        __builtin_memcpy(info.table_name, "iptables", 9);
+    }
+    
+    if (skb) {
+        void *data_ptr = 0;
+        u32 len = 0;
+        
+        bpf_probe_read(&data_ptr, sizeof(data_ptr), (char*)skb + 0xD8);
+        bpf_probe_read(&len, sizeof(len), (char*)skb + 0x88);
+        
+        if (data_ptr && len > 14) {
+            struct simple_iphdr ip_hdr;
+            
+            if (bpf_probe_read(&ip_hdr, sizeof(ip_hdr), data_ptr + 14) == 0) {
+                if (ip_hdr.version == 4) {
+                    info.src_ip = ip_hdr.saddr;
+                    info.dst_ip = ip_hdr.daddr;
+                    info.protocol = ip_hdr.protocol;
+                    info.packet_len = len;
+                    
+                    u8 ip_hdr_len = ip_hdr.ihl * 4;
+                    if (ip_hdr.protocol == 6) { // TCP
+                        struct simple_tcphdr tcp_hdr;
+                        if (bpf_probe_read(&tcp_hdr, sizeof(tcp_hdr), 
+                                         data_ptr + 14 + ip_hdr_len) == 0) {
+                            info.src_port = bpf_ntohs(tcp_hdr.source);
+                            info.dst_port = bpf_ntohs(tcp_hdr.dest);
+                        }
+                    } else if (ip_hdr.protocol == 17) { // UDP
+                        struct simple_udphdr udp_hdr;
+                        if (bpf_probe_read(&udp_hdr, sizeof(udp_hdr), 
+                                         data_ptr + 14 + ip_hdr_len) == 0) {
+                            info.src_port = bpf_ntohs(udp_hdr.source);
+                            info.dst_port = bpf_ntohs(udp_hdr.dest);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Set chain names based on hook number
+    switch (info.hooknum) {
+        case 0:
+            __builtin_memcpy(info.chain_name, "PREROUTING", 11);
+            break;
+        case 1:
+            __builtin_memcpy(info.chain_name, "INPUT", 6);
+            break;
+        case 2:
+            __builtin_memcpy(info.chain_name, "FORWARD", 8);
+            break;
+        case 3:
+            __builtin_memcpy(info.chain_name, "OUTPUT", 7);
+            break;
+        case 4:
+            __builtin_memcpy(info.chain_name, "POSTROUTING", 12);
+            break;
+        default:
+            __builtin_memcpy(info.chain_name, "UNKNOWN", 8);
+            break;
+    }
+    
+    if (packet_matches_filter(&info)) {
+        packet_events.perf_submit(ctx, &info, sizeof(info));
+    }
+    
+    return 0;
+}
+
 
 """
 
 
 class NetFilterMonitor:
-    def __init__(self, src_ip=None, dst_ip=None, host=None, src_port=None, dst_port=None, protocol=None):
+    def __init__(self, src_ip=None, dst_ip=None, host=None, src_port=None, dst_port=None, protocol=None, verbose=False):
         self.bpf = None
         self.src_ip = src_ip
         self.dst_ip = dst_ip
@@ -238,6 +351,7 @@ class NetFilterMonitor:
         self.src_port = src_port
         self.dst_port = dst_port
         self.protocol = protocol
+        self.verbose = verbose
         self.hook_names = {
             0: "PREROUTING",
             1: "INPUT",
@@ -246,17 +360,62 @@ class NetFilterMonitor:
             4: "POSTROUTING"
         }
         self.pf_names = {
-            2: "IPv4",
-            10: "IPv6",
             0: "UNSPEC",
-            1: "UNIX",
+            1: "UNIX", 
+            2: "IPv4",
             3: "AX25",
             4: "IPX",
             5: "APPLETALK",
             6: "NETROM",
             7: "BRIDGE",
-            8: "ATMPVC",
-            9: "X25"
+            8: "ATMPVC", 
+            9: "X25",
+            10: "IPv6",
+            11: "ROSE",
+            12: "DECnet",
+            13: "NETBEUI",
+            14: "SECURITY",
+            15: "KEY",
+            16: "NETLINK",
+            17: "PACKET",
+            18: "ASH",
+            19: "ECONET",
+            20: "ATMSVC",
+            21: "RDS",
+            22: "SNA",
+            23: "IRDA",
+            24: "PPPOX",
+            25: "WANPIPE",
+            26: "LLC",
+            27: "IB",
+            28: "MPLS",
+            29: "CAN",
+            30: "TIPC",
+            31: "BLUETOOTH",
+            32: "IUCV",
+            33: "RXRPC",
+            34: "ISDN",
+            35: "PHONET",
+            36: "IEEE802154",
+            37: "CAIF",
+            38: "ALG",
+            39: "NFC",
+            40: "VSOCK"
+        }
+        
+        # Extended table information
+        self.table_info = {
+            'filter': 'Packet filtering (default)',
+            'nat': 'Network Address Translation',  
+            'mangle': 'Packet alteration',
+            'raw': 'Connection tracking bypass',
+            'security': 'Mandatory Access Control',
+            'broute': 'Bridge routing decisions',
+            'iptables': 'Generic iptables',
+            'ip6tables': 'IPv6 tables',
+            'ebtables': 'Ethernet bridge tables',
+            'arptables': 'ARP tables',
+            'unknown': 'Unknown table'
         }
     def setup_filters(self):
         if not any([self.src_ip, self.dst_ip, self.host, self.src_port, self.dst_port, self.protocol]):
@@ -271,15 +430,18 @@ class NetFilterMonitor:
             filter_enable_map[ctypes.c_uint32(0)] = ctypes.c_uint32(1)
             filter_host_ip_map[ctypes.c_uint32(0)] = ctypes.c_uint32(host_ip_int)
             
-            print(f"Filtering by host: {self.host} (filter value: {host_ip_int:08x})")
-            
-            # Verify the settings
-            try:
-                enabled = filter_enable_map[ctypes.c_uint32(0)].value
-                host_ip = filter_host_ip_map[ctypes.c_uint32(0)].value
-                print(f"BPF filter configured: enabled={enabled}, host_ip={host_ip:08x}")
-            except Exception as e:
-                print(f"Error verifying filter: {e}")
+            if self.verbose:
+                print(f"Filtering by host: {self.host} (filter value: {host_ip_int:08x})")
+                
+                # Verify the settings
+                try:
+                    enabled = filter_enable_map[ctypes.c_uint32(0)].value
+                    host_ip = filter_host_ip_map[ctypes.c_uint32(0)].value
+                    print(f"BPF filter configured: enabled={enabled}, host_ip={host_ip:08x}")
+                except Exception as e:
+                    print(f"Error verifying filter: {e}")
+            else:
+                print(f"Filtering by host: {self.host}")
         
 
     def protocol_name(self, protocol):
@@ -313,41 +475,108 @@ class NetFilterMonitor:
             chain_name = chain
 
         timestamp = event.timestamp / 1000000000.0
-        print(f"{timestamp:17.6f} {pf_name:5s} {table_name:12s} {chain_name:12s} {src_ip:15s} {dst_ip:15s} {self.protocol_name(event.protocol):5s} {event.src_port:5d} {event.dst_port:5d} {event.packet_len:5d}")
+        print(f"{timestamp:17.6f} {pf_name:7s} {table_name:11s} {chain_name:11s} {src_ip:15s} {dst_ip:15s} {self.protocol_name(event.protocol):5s} {event.src_port:5d} {event.dst_port:5d} {event.packet_len:5d}")
 
     def start_monitoring(self):
         try:
-            print("Loading eBPF program...")
-            self.bpf = BPF(text=bpf_source)
+            if self.verbose:
+                print("Loading eBPF program...")
+            
+            # Suppress BCC compilation warnings and errors unless verbose
+            import sys
+            import os
+            from contextlib import redirect_stderr
+            
+            if not self.verbose:
+                devnull = open(os.devnull, 'w')
+                with redirect_stderr(devnull):
+                    self.bpf = BPF(text=bpf_source)
+                devnull.close()
+            else:
+                self.bpf = BPF(text=bpf_source)
+            
             self.setup_filters()
             
-            # kprobesでNetFilterフック関数をトレース (改善版)
+            # kprobesでNetFilterフック関数をトレース (全テーブル対応版)
             attached_count = 0
             
-            # メインのNetFilterフック関数を試行
+            # 包括的なNetFilterフック関数を試行
             hooks_to_try = [
+                # Main netfilter hook functions
                 ("nf_hook_slow", "trace_nf_hook_slow"),
-                ("ipt_do_table", "trace_nf_hook_slow"), 
                 ("nf_hook_thresh", "trace_nf_hook_slow"),
+                
+                # iptables table-specific functions
+                ("ipt_do_table", "trace_ipt_do_table"),
+                ("iptable_filter_hook", "trace_ipt_do_table"),
+                ("iptable_nat_do_chain", "trace_ipt_do_table"),
+                ("iptable_mangle_hook", "trace_ipt_do_table"),
+                ("iptable_raw_hook", "trace_ipt_do_table"),
+                ("iptable_security_hook", "trace_ipt_do_table"),
+                
+                # ip6tables functions for IPv6
+                ("ip6t_do_table", "trace_ipt_do_table"),
+                ("ip6table_filter_hook", "trace_ipt_do_table"),
+                ("ip6table_nat_do_chain", "trace_ipt_do_table"),
+                ("ip6table_mangle_hook", "trace_ipt_do_table"),
+                ("ip6table_raw_hook", "trace_ipt_do_table"), 
+                ("ip6table_security_hook", "trace_ipt_do_table"),
+                
+                # nftables functions
                 ("nft_do_chain", "trace_nf_hook_slow"),
-                ("iptable_filter_hook", "trace_nf_hook_slow")
+                ("nf_tables_core_module", "trace_nf_hook_slow"),
+                
+                # ebtables for bridge filtering
+                ("ebt_do_table", "trace_ipt_do_table"),
+                
+                # arptables for ARP filtering
+                ("arpt_do_table", "trace_ipt_do_table"),
+                
+                # Connection tracking hooks
+                ("nf_conntrack_in", "trace_nf_hook_slow"),
+                ("ipv4_conntrack_in", "trace_nf_hook_slow"),
+                ("ipv6_conntrack_in", "trace_nf_hook_slow"),
+                
+                # NAT hooks
+                ("nf_nat_ipv4_in", "trace_nf_hook_slow"),
+                ("nf_nat_ipv4_out", "trace_nf_hook_slow"),
+                ("nf_nat_ipv4_local_in", "trace_nf_hook_slow"),
+                ("nf_nat_ipv4_local_out", "trace_nf_hook_slow"),
+                
+                # Older kernel functions
+                ("nf_iterate", "trace_nf_hook_slow"),
+                ("nf_hook", "trace_nf_hook_slow")
             ]
             
-            for event, fn_name in hooks_to_try:
-                try:
-                    self.bpf.attach_kprobe(event=event, fn_name=fn_name)
-                    print(f"Successfully attached to {event}")
-                    attached_count += 1
-                except Exception as e:
-                    print(f"Info: Could not attach to {event}: {e}")
+            # Suppress kprobe attachment errors unless verbose
+            if not self.verbose:
+                devnull = open(os.devnull, 'w')
+                with redirect_stderr(devnull):
+                    for event, fn_name in hooks_to_try:
+                        try:
+                            self.bpf.attach_kprobe(event=event, fn_name=fn_name)
+                            attached_count += 1
+                        except Exception:
+                            pass
+                devnull.close()
+            else:
+                for event, fn_name in hooks_to_try:
+                    try:
+                        self.bpf.attach_kprobe(event=event, fn_name=fn_name)
+                        print(f"Successfully attached to {event}")
+                        attached_count += 1
+                    except Exception as e:
+                        print(f"Info: Could not attach to {event}: {e}")
             
             if attached_count == 0:
                 print("Warning: Could not attach to any netfilter hooks")
                 print("This may be due to kernel version or netfilter not being active")
+            elif self.verbose:
+                print(f"\nAttached to {attached_count} netfilter hook points")
             
-            print("\nNetFilter Tables/Chains Monitor")
-            print("Time         PF      Table       Chain       Src IP      Dst IP      Proto   SPort   DPort   Len")
-            print("-" * 115)
+            print("\nComprehensive NetFilter Tables/Chains Monitor")
+            print("Time         PF      Table       Chain       Src IP          Dst IP          Proto   SPort   DPort   Len")
+            print("-" * 120)
 
             self.bpf["packet_events"].open_perf_buffer(self.handle_packet)
             while True:
@@ -389,6 +618,7 @@ Examples:
     parser.add_argument('--src-port',type=int,help='Filter by source port')
     parser.add_argument('--dst-port',type=int,help='Filter by destination port')
     parser.add_argument('--protocol',type=str,help='Filter by protocol: tcp, udp, icmp or protocol number')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Show verbose output including attachment errors')
 
     args = parser.parse_args()
 
@@ -404,7 +634,8 @@ Examples:
             host=args.host,
             src_port=args.src_port,
             dst_port=args.dst_port,
-            protocol=args.protocol
+            protocol=args.protocol,
+            verbose=args.verbose
     )
     try:
         return monitor.start_monitoring()
