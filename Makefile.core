@@ -1,0 +1,141 @@
+# BPF CO-RE Makefile for nfdump
+CLANG ?= clang
+LLVM_STRIP ?= llvm-strip
+BPFTOOL ?= bpftool
+LIBBPF_DIR = /usr/include/bpf
+LIBBPF_LIB = /usr/lib/x86_64-linux-gnu
+
+# Kernel headers
+KERNEL_RELEASE = $(shell uname -r)
+VMLINUX = ./vmlinux.h
+
+# BPF program
+BPF_PROGRAM = nfdump_btf.bpf.c
+BPF_OBJECT = nfdump_btf.bpf.o
+BPF_SKELETON = nfdump_btf.skel.h
+
+# User space program
+USER_PROGRAM = nfdump_core.c
+USER_BINARY = nfdump_core
+
+# Compiler flags
+CFLAGS = -g -Wall -Wextra -O2 -D_GNU_SOURCE
+CFLAGS += -I$(LIBBPF_DIR) -I.
+BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_x86_64
+
+# Libraries
+LDFLAGS = -L$(LIBBPF_LIB) -lbpf -lelf -lz
+
+.PHONY: all clean vmlinux install-deps check-deps
+
+all: check-deps $(USER_BINARY)
+
+# Check dependencies
+check-deps:
+	@echo "Checking dependencies..."
+	@which $(CLANG) > /dev/null || (echo "Error: clang not found. Install with: apt install clang" && exit 1)
+	@which $(LLVM_STRIP) > /dev/null || (echo "Error: llvm-strip not found. Install with: apt install llvm" && exit 1)
+	@which $(BPFTOOL) > /dev/null || (echo "Error: bpftool not found. Install with: apt install linux-tools-generic" && exit 1)
+	@test -f $(LIBBPF_LIB)/libbpf.a -o -f $(LIBBPF_LIB)/libbpf.so || (echo "Error: libbpf not found. Install with: apt install libbpf-dev" && exit 1)
+	@test -d $(LIBBPF_DIR) || (echo "Error: libbpf headers not found. Install with: apt install libbpf-dev" && exit 1)
+	@test -f $(VMLINUX) || (echo "Error: vmlinux.h not found. Generate with: bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h" && exit 1)
+	@echo "All dependencies found!"
+
+# Install dependencies (Ubuntu/Debian)
+install-deps:
+	@echo "Installing BPF CO-RE dependencies..."
+	sudo apt update
+	sudo apt install -y \
+		clang \
+		llvm \
+		libbpf-dev \
+		libelf-dev \
+		zlib1g-dev \
+		linux-tools-generic \
+		linux-tools-$(KERNEL_RELEASE) \
+		build-essential
+	@echo "Dependencies installed!"
+
+# Generate vmlinux.h if not exists
+$(VMLINUX):
+	@echo "Generating vmlinux.h from BTF..."
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $(VMLINUX) || \
+		(echo "Failed to generate vmlinux.h. Ensure BTF is enabled in kernel." && exit 1)
+
+# Compile BPF program
+$(BPF_OBJECT): $(BPF_PROGRAM) $(VMLINUX)
+	@echo "Compiling BPF program..."
+	$(CLANG) $(BPF_CFLAGS) -I$(LIBBPF_DIR) -c $(BPF_PROGRAM) -o $(BPF_OBJECT)
+	$(LLVM_STRIP) -g $(BPF_OBJECT)
+
+# Generate BPF skeleton
+$(BPF_SKELETON): $(BPF_OBJECT)
+	@echo "Generating BPF skeleton..."
+	$(BPFTOOL) gen skeleton $(BPF_OBJECT) > $(BPF_SKELETON)
+
+# Compile user space program
+$(USER_BINARY): $(USER_PROGRAM) $(BPF_SKELETON)
+	@echo "Compiling user space program..."
+	$(CC) $(CFLAGS) $(USER_PROGRAM) -o $(USER_BINARY) $(LDFLAGS)
+
+# Test build
+test: $(USER_BINARY)
+	@echo "Build completed successfully!"
+	@echo "Run with: sudo ./$(USER_BINARY)"
+
+# Clean build artifacts
+clean:
+	rm -f $(BPF_OBJECT) $(BPF_SKELETON) $(USER_BINARY)
+	@echo "Cleaned build artifacts"
+
+# Clean everything including vmlinux.h
+clean-all: clean
+	rm -f $(VMLINUX)
+	@echo "Cleaned all artifacts"
+
+# Debug build with verbose output
+debug: CFLAGS += -DDEBUG -g3
+debug: BPF_CFLAGS += -DDEBUG
+debug: $(USER_BINARY)
+	@echo "Debug build completed"
+
+# Check BPF program validity
+check-bpf: $(BPF_OBJECT)
+	@echo "Verifying BPF program..."
+	$(BPFTOOL) prog load $(BPF_OBJECT) /sys/fs/bpf/nfdump_test 2>/dev/null && \
+		$(BPFTOOL) prog del /sys/fs/bpf/nfdump_test 2>/dev/null || true
+	@echo "BPF program verification passed"
+
+# Show BPF program info
+info: $(BPF_OBJECT)
+	@echo "BPF Object Information:"
+	$(BPFTOOL) prog show
+	@echo ""
+	@echo "BPF Maps:"
+	$(BPFTOOL) map show
+
+# Help
+help:
+	@echo "BPF CO-RE nfdump Makefile"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all          - Build everything (default)"
+	@echo "  check-deps   - Check if all dependencies are installed"
+	@echo "  install-deps - Install required dependencies (Ubuntu/Debian)"
+	@echo "  test         - Test build"
+	@echo "  debug        - Build with debug symbols"
+	@echo "  check-bpf    - Verify BPF program can be loaded"
+	@echo "  info         - Show BPF program and map information"
+	@echo "  clean        - Clean build artifacts"
+	@echo "  clean-all    - Clean all artifacts including vmlinux.h"
+	@echo "  help         - Show this help message"
+	@echo ""
+	@echo "Usage examples:"
+	@echo "  make install-deps  # Install dependencies"
+	@echo "  make               # Build program"
+	@echo "  sudo ./nfdump_core # Run program"
+	@echo ""
+	@echo "Requirements:"
+	@echo "  - Linux kernel with BTF support (>= 5.8 recommended)"
+	@echo "  - Root privileges to run"
+	@echo "  - clang, llvm, libbpf-dev, bpftool"
