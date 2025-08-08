@@ -10,10 +10,59 @@
 #define IP_MF 0x2000
 #define IP_OFFSET 0x1FFF
 
-// xt_table structure for reading table names
-// Using CO-RE for better compatibility
-struct xt_table_compat {
-    char name[32];
+// iptables table structure for reading table names
+// Using CO-RE for better compatibility  
+struct xt_table {
+    struct list_head list;
+    unsigned int valid_hooks;
+    struct xt_table_info *private;
+    void *me;
+    u_int8_t af;
+    int priority;
+    const char name[];
+} __attribute__((preserve_access_index));
+
+// nftables chain structure for reading chain info
+struct nft_chain {
+    struct list_head list;
+    struct rhltable rules_ht;
+    struct list_head rules;
+    struct list_head hook_list;
+    struct nft_table *table;  // Pointer to table
+    u64 handle;
+    u32 use;
+    u8 flags;
+    u8 family;
+    char *name;
+} __attribute__((preserve_access_index));
+
+// nftables table structure for reading table names
+struct nft_table {
+    struct list_head list;
+    struct rhltable chains_ht;
+    struct list_head chains;
+    struct list_head sets;
+    struct list_head objects;
+    struct list_head flowtables;  
+    u64 hgeneseq;
+    u32 use;
+    u16 family;
+    u16 flags;
+    u32 nlpid;
+    char *name;
+    u16 udlen;
+    u8 *udata;
+} __attribute__((preserve_access_index));
+
+// nftables packet info structure
+struct nft_pktinfo {
+    struct sk_buff *skb;
+    struct nf_hook_state *xt;
+    bool tprot_set;
+    u8 tprot;
+    u16 fragoff;
+    u16 thoff;
+    u16 inneroff;
 } __attribute__((preserve_access_index));
 
 // Packet information structure for events
@@ -120,26 +169,65 @@ static __always_inline int packet_matches_filter(struct packet_info *info) {
 }
 
 static __always_inline void set_chain_name(struct packet_info *info, __u8 hook) {
+    // Initialize with null terminator for safety
+    info->chain_name[0] = '\0';
+    
     switch (hook) {
         case NF_INET_PRE_ROUTING:
-            __builtin_memcpy(info->chain_name, "PREROUTING", 11);
+            __builtin_memcpy(info->chain_name, "PREROUTING\0", 11);
             break;
         case NF_INET_LOCAL_IN:
-            __builtin_memcpy(info->chain_name, "INPUT", 6);
+            __builtin_memcpy(info->chain_name, "INPUT\0", 6);
             break;
         case NF_INET_FORWARD:
-            __builtin_memcpy(info->chain_name, "FORWARD", 8);
+            __builtin_memcpy(info->chain_name, "FORWARD\0", 8);
             break;
         case NF_INET_LOCAL_OUT:
-            __builtin_memcpy(info->chain_name, "OUTPUT", 7);
+            __builtin_memcpy(info->chain_name, "OUTPUT\0", 7);
             break;
         case NF_INET_POST_ROUTING:
-            __builtin_memcpy(info->chain_name, "POSTROUTING", 12);
+            __builtin_memcpy(info->chain_name, "POSTROUTING\0", 12);
             break;
         default:
-            __builtin_memcpy(info->chain_name, "UNKNOWN", 8);
+            __builtin_memcpy(info->chain_name, "UNKNOWN\0", 8);
             break;
     }
+}
+
+// Helper function for safe table name extraction
+static __always_inline int extract_table_name(struct packet_info *info, const char *table_name_ptr, const char *default_name) {
+    // Initialize table name to default
+    __builtin_memset(info->table_name, 0, MAX_TABLE_NAME);
+    if (default_name) {
+        int i = 0;
+        while (i < (MAX_TABLE_NAME - 1) && default_name[i] != '\0') {
+            info->table_name[i] = default_name[i];
+            i++;
+        }
+        info->table_name[MAX_TABLE_NAME - 1] = '\0';
+    }
+    
+    if (!table_name_ptr) {
+        return -1;
+    }
+    
+    // Try to read table name string safely
+    char table_name_buf[MAX_TABLE_NAME] = {};
+    long ret = bpf_probe_read_kernel_str(table_name_buf, sizeof(table_name_buf), table_name_ptr);
+    if (ret <= 0) {
+        return -1;
+    }
+    
+    // Validate table name (basic sanity check)
+    if (table_name_buf[0] == '\0' || table_name_buf[0] < 'a' || table_name_buf[0] > 'z') {
+        return -1;
+    }
+    
+    // Copy validated table name
+    __builtin_memcpy(info->table_name, table_name_buf, MAX_TABLE_NAME - 1);
+    info->table_name[MAX_TABLE_NAME - 1] = '\0';
+    
+    return 0;
 }
 
 // Enhanced packet parsing with better CO-RE support
@@ -364,24 +452,34 @@ int BPF_PROG(trace_ipt_do_table, struct sk_buff *skb, struct nf_hook_state *stat
     if (parse_ip_packet(skb, &info) < 0)
         return 0;
 
-    // Simple approach: Mark that we hit ipt_do_table and try to read table name
-    __builtin_memcpy(info.table_name, "IPT_CALLED", 11);
-    
-    // Try to read table name using proper structure access
+    // Try to read table name using CO-RE and proper structure access
     if (table) {
-        // Try reading first few bytes to see if we can find table name
-        char name_attempt[16] = {};
-        if (bpf_probe_read_kernel(name_attempt, sizeof(name_attempt), table) == 0) {
-            // Check if first bytes look like a table name
-            if ((name_attempt[0] == 'f' && name_attempt[1] == 'i' && name_attempt[2] == 'l') || // "filter"
-                (name_attempt[0] == 'n' && name_attempt[1] == 'a' && name_attempt[2] == 't') || // "nat"  
-                (name_attempt[0] == 'm' && name_attempt[1] == 'a' && name_attempt[2] == 'n') || // "mangle"
-                (name_attempt[0] == 'r' && name_attempt[1] == 'a' && name_attempt[2] == 'w') || // "raw"
-                (name_attempt[0] == 's' && name_attempt[1] == 'e' && name_attempt[2] == 'c')) { // "security"
-                __builtin_memcpy(info.table_name, name_attempt, 15);
-                info.table_name[15] = '\0';
+        struct xt_table *xt_tbl = (struct xt_table *)table;
+        const char *table_name_ptr = NULL;
+        
+        // Use BPF CO-RE to read the name field pointer
+        if (bpf_core_read(&table_name_ptr, sizeof(table_name_ptr), &xt_tbl->name) == 0) {
+            if (extract_table_name(&info, table_name_ptr, "iptables") == 0) {
+                // Successfully extracted table name
+            } else {
+                // Fallback: try reading the name field as inline array instead of pointer
+                char name_buf[MAX_TABLE_NAME] = {};
+                if (bpf_probe_read_kernel_str(name_buf, sizeof(name_buf), (char *)&xt_tbl->name) > 0) {
+                    if (name_buf[0] != '\0' && name_buf[0] >= 'a' && name_buf[0] <= 'z') {
+                        __builtin_memcpy(info.table_name, name_buf, MAX_TABLE_NAME - 1);
+                        info.table_name[MAX_TABLE_NAME - 1] = '\0';
+                    } else {
+                        extract_table_name(&info, NULL, "iptables");
+                    }
+                } else {
+                    extract_table_name(&info, NULL, "iptables");
+                }
             }
+        } else {
+            extract_table_name(&info, NULL, "iptables");
         }
+    } else {
+        extract_table_name(&info, NULL, "iptables");
     }
 
     set_chain_name(&info, info.hook_num);
@@ -400,12 +498,60 @@ int BPF_PROG(trace_ipt_do_table, struct sk_buff *skb, struct nf_hook_state *stat
 //     return 0;
 // }
 
-// nftables support - commented out due to kernel compatibility
-// SEC("fentry/nft_do_chain")
-// int BPF_PROG(trace_nft_do_chain, void *pkt, void *priv) {
-//     // Implementation removed for compatibility  
-//     return 0;
-// }
+// nftables support - re-enabled for proper table name detection
+SEC("fentry/nft_do_chain")
+int BPF_PROG(trace_nft_do_chain, struct nft_pktinfo *pkt, void *priv) {
+    struct packet_info info = {};
+    struct sk_buff *skb = NULL;
+    
+    info.timestamp = bpf_ktime_get_ns();
+    info.verdict = 0;
+    
+    // Try to read sk_buff from nft_pktinfo - simplified approach
+    if (bpf_probe_read_kernel(&skb, sizeof(skb), pkt) < 0 || !skb)
+        return 0;
+    
+    // Set default values
+    info.hook_num = 1; // Default to INPUT
+    info.pf = NFPROTO_IPV4;
+    
+    // Parse packet data
+    if (parse_ip_packet(skb, &info) < 0)
+        return 0;
+
+    // Extract nftables table name via chain->table->name path
+    if (priv) {
+        struct nft_chain *chain = (struct nft_chain *)priv;
+        struct nft_table *table = NULL;
+        
+        // Read table pointer from nft_chain using BPF CO-RE
+        if (bpf_core_read(&table, sizeof(table), &chain->table) == 0 && table) {
+            char *table_name_ptr = NULL;
+            // Read table name pointer from nft_table using BPF CO-RE
+            if (bpf_core_read(&table_name_ptr, sizeof(table_name_ptr), &table->name) == 0 && table_name_ptr) {
+                // Successfully got table name via nft_chain->nft_table->name
+                if (extract_table_name(&info, table_name_ptr, "nftables") != 0) {
+                    // Fallback to default name if extraction fails
+                    extract_table_name(&info, NULL, "nftables");
+                }
+            } else {
+                extract_table_name(&info, NULL, "nftables");
+            }
+        } else {
+            extract_table_name(&info, NULL, "nftables");
+        }
+    } else {
+        extract_table_name(&info, NULL, "nftables");
+    }
+
+    set_chain_name(&info, info.hook_num);
+
+    if (!packet_matches_filter(&info))
+        return 0;
+
+    bpf_ringbuf_output(&packet_events, &info, sizeof(info), 0);
+    return 0;
+}
 
 // Connection tracking hook - commented out due to kernel compatibility  
 // SEC("fentry/nf_conntrack_in")
