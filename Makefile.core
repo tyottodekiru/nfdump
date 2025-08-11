@@ -9,14 +9,21 @@ LIBBPF_LIB = /usr/lib/x86_64-linux-gnu
 KERNEL_RELEASE = $(shell uname -r)
 VMLINUX = ./vmlinux.h
 
-# BPF program
+# BPF programs
 BPF_PROGRAM = nfdump_btf.bpf.c
 BPF_OBJECT = nfdump_btf.bpf.o
 BPF_SKELETON = nfdump_btf.skel.h
 
-# User space program
+BPF_PROGRAM_LEGACY = nfdump_legacy.bpf.c
+BPF_OBJECT_LEGACY = nfdump_legacy.bpf.o
+BPF_SKELETON_LEGACY = nfdump_legacy.skel.h
+
+# User space programs
 USER_PROGRAM = nfdump_core.c
 USER_BINARY = nfdump_core
+
+USER_PROGRAM_LEGACY = nfdump_core_legacy.c
+USER_BINARY_LEGACY = nfdump_core_legacy
 
 # Compiler flags
 CFLAGS = -g -Wall -Wextra -O2 -D_GNU_SOURCE
@@ -26,9 +33,13 @@ BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_x86_64
 # Libraries
 LDFLAGS = -L$(LIBBPF_LIB) -lbpf -lelf -lz
 
-.PHONY: all clean vmlinux install-deps check-deps
+.PHONY: all clean vmlinux install-deps check-deps legacy
 
 all: check-deps $(USER_BINARY)
+
+legacy: check-deps $(USER_BINARY_LEGACY)
+
+both: check-deps $(USER_BINARY) $(USER_BINARY_LEGACY)
 
 # Check dependencies
 check-deps:
@@ -62,30 +73,53 @@ $(VMLINUX):
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $(VMLINUX) || \
 		(echo "Failed to generate vmlinux.h. Ensure BTF is enabled in kernel." && exit 1)
 
-# Compile BPF program
+# Compile BPF programs
 $(BPF_OBJECT): $(BPF_PROGRAM) $(VMLINUX)
-	@echo "Compiling BPF program..."
+	@echo "Compiling BPF program (nftables)..."
 	$(CLANG) $(BPF_CFLAGS) -I$(LIBBPF_DIR) -c $(BPF_PROGRAM) -o $(BPF_OBJECT)
 	$(LLVM_STRIP) -g $(BPF_OBJECT)
 
-# Generate BPF skeleton
+$(BPF_OBJECT_LEGACY): $(BPF_PROGRAM_LEGACY) $(VMLINUX)
+	@echo "Compiling BPF program (legacy)..."
+	$(CLANG) $(BPF_CFLAGS) -I$(LIBBPF_DIR) -c $(BPF_PROGRAM_LEGACY) -o $(BPF_OBJECT_LEGACY)
+	$(LLVM_STRIP) -g $(BPF_OBJECT_LEGACY)
+
+# Generate BPF skeletons
 $(BPF_SKELETON): $(BPF_OBJECT)
-	@echo "Generating BPF skeleton..."
+	@echo "Generating BPF skeleton (nftables)..."
 	$(BPFTOOL) gen skeleton $(BPF_OBJECT) > $(BPF_SKELETON)
 
-# Compile user space program
+$(BPF_SKELETON_LEGACY): $(BPF_OBJECT_LEGACY)
+	@echo "Generating BPF skeleton (legacy)..."
+	$(BPFTOOL) gen skeleton $(BPF_OBJECT_LEGACY) > $(BPF_SKELETON_LEGACY)
+
+# Compile user space programs
 $(USER_BINARY): $(USER_PROGRAM) $(BPF_SKELETON)
-	@echo "Compiling user space program..."
+	@echo "Compiling user space program (nftables)..."
 	$(CC) $(CFLAGS) $(USER_PROGRAM) -o $(USER_BINARY) $(LDFLAGS)
+
+$(USER_BINARY_LEGACY): $(USER_PROGRAM_LEGACY) $(BPF_SKELETON_LEGACY)
+	@echo "Compiling user space program (legacy)..."
+	$(CC) $(CFLAGS) $(USER_PROGRAM_LEGACY) -o $(USER_BINARY_LEGACY) $(LDFLAGS)
 
 # Test build
 test: $(USER_BINARY)
 	@echo "Build completed successfully!"
 	@echo "Run with: sudo ./$(USER_BINARY)"
 
+test-legacy: $(USER_BINARY_LEGACY)
+	@echo "Legacy build completed successfully!"
+	@echo "Run with: sudo ./$(USER_BINARY_LEGACY)"
+
+test-both: $(USER_BINARY) $(USER_BINARY_LEGACY)
+	@echo "Both builds completed successfully!"
+	@echo "Run NFTables version with: sudo ./$(USER_BINARY)"
+	@echo "Run Legacy version with: sudo ./$(USER_BINARY_LEGACY)"
+
 # Clean build artifacts
 clean:
 	rm -f $(BPF_OBJECT) $(BPF_SKELETON) $(USER_BINARY)
+	rm -f $(BPF_OBJECT_LEGACY) $(BPF_SKELETON_LEGACY) $(USER_BINARY_LEGACY)
 	@echo "Cleaned build artifacts"
 
 # Clean everything including vmlinux.h
@@ -119,10 +153,14 @@ help:
 	@echo "BPF CO-RE nfdump Makefile"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all          - Build everything (default)"
+	@echo "  all          - Build nftables version (default)"
+	@echo "  legacy       - Build iptables legacy version"
+	@echo "  both         - Build both versions"
 	@echo "  check-deps   - Check if all dependencies are installed"
 	@echo "  install-deps - Install required dependencies (Ubuntu/Debian)"
-	@echo "  test         - Test build"
+	@echo "  test         - Test nftables build"
+	@echo "  test-legacy  - Test legacy build"
+	@echo "  test-both    - Test both builds"
 	@echo "  debug        - Build with debug symbols"
 	@echo "  check-bpf    - Verify BPF program can be loaded"
 	@echo "  info         - Show BPF program and map information"
@@ -131,9 +169,10 @@ help:
 	@echo "  help         - Show this help message"
 	@echo ""
 	@echo "Usage examples:"
-	@echo "  make install-deps  # Install dependencies"
-	@echo "  make               # Build program"
-	@echo "  sudo ./nfdump_core # Run program"
+	@echo "  make install-deps    # Install dependencies"
+	@echo "  make both           # Build both versions"
+	@echo "  sudo ./nfdump_core        # Run nftables version"
+	@echo "  sudo ./nfdump_core_legacy # Run iptables legacy version"
 	@echo ""
 	@echo "Requirements:"
 	@echo "  - Linux kernel with BTF support (>= 5.8 recommended)"
